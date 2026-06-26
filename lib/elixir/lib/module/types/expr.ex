@@ -549,6 +549,65 @@ defmodule Module.Types.Expr do
     Apply.fun(fun_type, args_types, call, stack, context)
   end
 
+  def of_expr(
+        {{:., _, [GenServer, :start_link]}, _meta, [mod | _] = args} = call,
+        _expected,
+        _expr,
+        stack,
+        context
+      )
+      when stack.mode == :dynamic do
+    {_args_types, context} =
+      Enum.map_reduce(args, context, &of_expr(&1, dynamic(), call, stack, &2))
+
+    # Find handle call signature in cache
+    handle_call_sig = Apply.genserver_callback_clauses(mod, :handle_call, 3, stack)
+    handle_cast_sig = Apply.genserver_callback_clauses(mod, :handle_cast, 2, stack)
+
+    # Extract request types from handle_cast signature
+    cast_msg_types =
+      case Enum.map(handle_cast_sig, fn {[request_type | _], _} -> request_type end) do
+        [] -> none()
+        [:term] -> none()
+        types -> Enum.reduce(types, &union/2)
+      end
+
+    # Extract call request types and reply return types in one pass over handle_call_sig
+    reply_shape = open_tuple([atom([:reply])])
+
+    {call_msg_types, return_types} =
+      case handle_call_sig do
+        [] ->
+          {none(), term()}
+
+        sig ->
+          Enum.reduce(sig, {none(), none()}, fn {[request_type | _], return_type}, {msgs, rets} ->
+            ret =
+              case tuple_fetch(intersection(return_type, reply_shape), 1) do
+                {_, type} -> type
+                _ -> none()
+              end
+
+            {union(msgs, request_type), union(rets, ret)}
+          end)
+      end
+
+    call_msg_types =
+      if return_types == none() and call_msg_types == term() do
+        none()
+      else
+        call_msg_types
+      end
+
+    # Union the request types from both handle_call and handle_cast
+    msg_types = union(call_msg_types, cast_msg_types)
+
+    success_type = tuple([atom([:ok]), pid(msg_types, return_types)])
+    error_type = union(tuple([atom([:error]), term()]), atom([:ignore]))
+
+    {union(success_type, error_type), context}
+  end
+
   def of_expr({{:., _, [callee, key_or_fun]}, meta, []} = call, expected, expr, stack, context)
       when not is_atom(callee) and is_atom(key_or_fun) do
     if Keyword.get(meta, :no_parens, false) do
@@ -559,6 +618,30 @@ defmodule Module.Types.Expr do
       {mods, context} = Of.modules(type, key_or_fun, 0, [:dot], call, meta, stack, context)
       apply_many(mods, key_or_fun, [], expected, call, stack, context)
     end
+  end
+
+  # Add receive accumulator to context and let the receive clauses update it as they are processed.
+  # This way we can reuse all the machinery we already have for processing receive clauses,
+  # and we don't need to worry about sanitizing pinned vars or declaring body variables.
+  # NOTE: this does not narrow the type based on the clause bodies.
+  def of_expr(
+        {{:., _, [:erlang, :spawn]}, _meta, [fun_arg]} = call,
+        _expected,
+        _expr,
+        stack,
+        context
+      ) do
+    # Add accumulator to context
+    context = Map.put(context, :receive_acc, none())
+
+    # Process the fun_arg passed to spawn/1 to fill the receive_acc
+    {_fun_type, context} = of_expr(fun_arg, dynamic(fun(0)), call, stack, context)
+
+    # Retrieve the accepted message types
+    msg_type = context.receive_acc
+
+    # Remove the receive accumulator as to not mess up other receive clauses
+    {pid(msg_type), Map.delete(context, :receive_acc)}
   end
 
   def of_expr({{:., _, [remote, name]}, meta, args} = call, expected, _expr, stack, context) do
@@ -839,6 +922,19 @@ defmodule Module.Types.Expr do
 
           {result, context} = of_body.(trees, body, context)
 
+          # Try and narrow type based on clause body
+          context =
+            if Map.has_key?(context, :receive_acc) and base_info == :receive and
+                 not context.failed do
+              body_clause_type = Pattern.of_domain(trees, stack, context)
+
+              Enum.reduce(body_clause_type, context, fn type, context ->
+                update_in(context.receive_acc, &union(&1, type))
+              end)
+            else
+              context
+            end
+
           {of_acc.(trees, result, context, acc), previous,
            context |> set_failed(failed?) |> Of.reset_vars(original)}
       end)
@@ -1080,4 +1176,18 @@ defmodule Module.Types.Expr do
         ])
     }
   end
+
+  #   ### Helper to get GenServer handle_call clauses in the given module.
+  # defp handle_call_clauses(module, stack),
+  #   do: genserver_callback_clauses(module, :handle_call, 3, stack)
+
+  # defp handle_cast_clauses(module, stack),
+  #   do: genserver_callback_clauses(module, :handle_cast, 2, stack)
+
+  # defp genserver_callback_clauses(module, fun, arity, stack) do
+  #   case ParallelChecker.fetch_export(stack.cache, module, fun, arity, false) do
+  #     {:ok, _, _, {_, _domain, clauses}} -> clauses
+  #     _ -> []
+  #   end
+  # end
 end

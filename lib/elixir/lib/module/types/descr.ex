@@ -21,10 +21,11 @@ defmodule Module.Types.Descr do
   @bit_empty_list 0b100
   @bit_integer 0b1000
   @bit_float 0b10000
-  @bit_pid 0b100000
+  # @bit_pid 0b100000
   @bit_port 0b1000000
   @bit_reference 0b10000000
-  @bit_top 0b11111111
+  # All bits exepts old pid bit, which we don't use anymore
+  @bit_top 0b11011111
 
   # We use two bits to represent bitstrings and binaries,
   # which must be looked at together
@@ -54,6 +55,7 @@ defmodule Module.Types.Descr do
   @non_empty_list_top {:term, :term}
   @tuple_top {:open, []}
   @map_empty {:closed, @fields_new}
+  @pid_top {%{}, :term}
 
   # The top BDD for each arity.
   @fun_bdd_top :bdd_top
@@ -65,7 +67,8 @@ defmodule Module.Types.Descr do
     tuple: @tuple_top,
     map: @map_top,
     list: @non_empty_list_top,
-    fun: @fun_top
+    fun: @fun_top,
+    pid: @pid_top
   }
   @list_top %{bitmap: @bit_empty_list, list: @non_empty_list_top}
   @empty_list %{bitmap: @bit_empty_list}
@@ -108,7 +111,9 @@ defmodule Module.Types.Descr do
   def open_map(), do: %{map: @map_top}
   def open_map(pairs), do: map_descr(:open, pairs)
   def open_tuple(elements, _fallback \\ term()), do: tuple_descr(:open, elements)
-  def pid(), do: %{bitmap: @bit_pid}
+  def pid(), do: %{pid: @pid_top}
+  def pid(msg_type), do: %{pid: {msg_type, :term}}
+  def pid(msg_type, return_type), do: %{pid: {msg_type, return_type}}
   def port(), do: %{bitmap: @bit_port}
   def reference(), do: %{bitmap: @bit_reference}
   def tuple(), do: %{tuple: @tuple_top}
@@ -442,6 +447,7 @@ defmodule Module.Types.Descr do
   defp union(:optional, 1, 1), do: 1
   defp union(:tuple, v1, v2), do: tuple_union(v1, v2)
   defp union(:fun, v1, v2), do: fun_union(v1, v2)
+  defp union(:pid, v1, v2), do: pid_union(v1, v2)
 
   @doc """
   Computes the intersection of two descrs.
@@ -482,6 +488,7 @@ defmodule Module.Types.Descr do
   defp intersection(:optional, 1, 1), do: 1
   defp intersection(:tuple, v1, v2), do: tuple_intersection(v1, v2)
   defp intersection(:fun, v1, v2), do: fun_intersection(v1, v2)
+  defp intersection(:pid, v1, v2), do: pid_intersection(v1, v2)
 
   defp intersection(:dynamic, v1, v2) do
     descr = dynamic_intersection(v1, v2)
@@ -571,6 +578,7 @@ defmodule Module.Types.Descr do
   defp difference(:optional, 1, 1), do: 0
   defp difference(:tuple, v1, v2), do: tuple_difference(v1, v2)
   defp difference(:fun, v1, v2), do: fun_difference(v1, v2)
+  defp difference(:pid, v1, v2), do: pid_difference(v1, v2)
 
   @doc """
   Compute the negation of a type.
@@ -603,6 +611,7 @@ defmodule Module.Types.Descr do
           (not Map.has_key?(descr, :tuple) or tuple_empty?(descr.tuple)) and
           (not Map.has_key?(descr, :map) or map_empty?(descr.map)) and
           (not Map.has_key?(descr, :list) or list_empty?(descr.list)) and
+          (not Map.has_key?(descr, :pid) or pid_empty?(descr.pid)) and
           (not Map.has_key?(descr, :fun) or fun_empty?(descr.fun))
     end
   end
@@ -615,6 +624,7 @@ defmodule Module.Types.Descr do
   defp empty_key?(:map, value), do: map_empty?(value)
   defp empty_key?(:list, value), do: list_empty?(value)
   defp empty_key?(:tuple, value), do: tuple_empty?(value)
+  defp empty_key?(:pid, value), do: pid_empty?(value)
   defp empty_key?(_, _value), do: false
 
   @doc """
@@ -795,6 +805,7 @@ defmodule Module.Types.Descr do
   defp to_quoted(:list, bdd, opts), do: list_to_quoted(bdd, false, opts)
   defp to_quoted(:tuple, bdd, opts), do: tuple_to_quoted(bdd, opts)
   defp to_quoted(:fun, bdd, opts), do: fun_to_quoted(bdd, opts)
+  defp to_quoted(:pid, msg_type, opts), do: pid_to_quoted(msg_type, opts)
 
   defp maybe_negated_term_type_to_quoted(static, opts) do
     if print_as_negated_type?(static) do
@@ -1060,7 +1071,6 @@ defmodule Module.Types.Descr do
         empty_list: @bit_empty_list,
         integer: @bit_integer,
         float: @bit_float,
-        pid: @bit_pid,
         port: @bit_port,
         reference: @bit_reference
       ]
@@ -2616,6 +2626,82 @@ defmodule Module.Types.Descr do
   defp pop_elem([h | t], key, acc), do: pop_elem(t, key, [h | acc])
   defp pop_elem([], _key, acc), do: {false, :lists.reverse(acc)}
 
+  ## Pid
+  defp pid_union({msg1, ret1}, {msg2, ret2}) do
+    msg = intersection(msg1, msg2)
+
+    ret = union(ret1, ret2)
+
+    {msg, ret}
+  end
+
+  defp pid_intersection({msg1, ret1}, {msg2, ret2}) do
+    # pid(none()) is the TOP (all pids), so this is never empty.
+    msg = union(msg1, msg2)
+
+    ret = intersection(ret1, ret2)
+
+    {msg, ret}
+  end
+
+  # defp pid_empty?({msg_type, _ret_type}), do: empty?(msg_type)
+  defp pid_empty?(0), do: true
+  defp pid_empty?({_msg_type, _ret_type}), do: false
+
+  # renders as  pid()  — both the sentinel :term and the top @none map render as untyped pid()
+  defp pid_to_quoted({msg_type, :term}, _opts) when msg_type == @none or msg_type == :term,
+    do: [{:pid, [], []}]
+
+  # renders as  pid(integer())
+  defp pid_to_quoted({msg_type, :term}, opts),
+    do: [{:pid, [], [to_quoted(msg_type, opts)]}]
+
+  # renders as  pid(integer(), atom())
+  defp pid_to_quoted({msg_type, ret_type}, opts),
+    do: [{:pid, [], [to_quoted(msg_type, opts), to_quoted(ret_type, opts)]}]
+
+  defp pid_difference({msg1, ret1}, {msg2, ret2}) do
+    if subtype?(msg2, msg1) and subtype?(ret1, ret2), do: 0, else: {msg1, ret1}
+  end
+
+  # Returns :none if no pid component, :term if untyped pid(),
+  # or the message descr if typed pid(T).
+  # def pid_message_type(%{pid: {msg_type, _ret_type}}), do: msg_type
+  def pid_message_type(%{pid: {msg_type, _ret_type}}) do
+    if empty?(msg_type), do: :none, else: msg_type
+  end
+
+  # term() contains pid()
+  def pid_message_type(:term), do: :term
+  def pid_message_type(%{dynamic: :term}), do: :term
+  def pid_message_type(%{dynamic: pid_type}), do: pid_message_type(pid_type)
+
+  def pid_message_type(%{map: {:closed, fields}}) when is_map(fields) do
+    case Map.fetch(fields, :pid) do
+      {:ok, pid_type} -> pid_message_type(pid_type)
+      :error -> :none
+    end
+  end
+
+  def pid_message_type(_), do: :none
+  # TODO: If not used, could be removed
+  # Returns :none if no pid component or no return type tracked,
+  # :term if the global term type, or the return descr if typed pid(T, R).
+  def pid_return_type(%{pid: {_msg_type, ret_type}}), do: ret_type
+  # term() contains pid()
+  def pid_return_type(:term), do: :term
+  def pid_return_type(%{dynamic: :term}), do: :term
+  def pid_return_type(%{dynamic: pid_type}), do: pid_return_type(pid_type)
+
+  def pid_return_type(%{map: {:closed, fields}}) when is_map(fields) do
+    case Map.fetch(fields, :pid) do
+      {:ok, pid_type} -> pid_return_type(pid_type)
+      :error -> :none
+    end
+  end
+
+  def pid_return_type(_), do: :none
+
   ## Dynamic
   #
   # A type with a dynamic component is a gradual type; without, it is a static
@@ -2752,7 +2838,6 @@ defmodule Module.Types.Descr do
     acc = if (bitmap &&& @bit_empty_list) != 0, do: [:list | acc], else: acc
     acc = if (bitmap &&& @bit_integer) != 0, do: [:integer | acc], else: acc
     acc = if (bitmap &&& @bit_float) != 0, do: [:float | acc], else: acc
-    acc = if (bitmap &&& @bit_pid) != 0, do: [:pid | acc], else: acc
     acc = if (bitmap &&& @bit_port) != 0, do: [:port | acc], else: acc
     acc = if (bitmap &&& @bit_reference) != 0, do: [:reference | acc], else: acc
     acc

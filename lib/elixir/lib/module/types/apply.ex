@@ -101,6 +101,8 @@ defmodule Module.Types.Apply do
     |> union(atom())
     |> union(tuple([atom(), atom()]))
 
+  @send_destination send_destination
+
   basic_arith_2_args_clauses = [
     {[integer(), integer()], integer()},
     {[integer(), float()], float()},
@@ -550,6 +552,61 @@ defmodule Module.Types.Apply do
     end
   end
 
+  defp do_remote(GenServer, :call, [pid, msg], _expected, expr, stack, context, of_fun) do
+    {msg_type, context} = of_fun.(msg, term(), expr, stack, context)
+
+    pid_expected =
+      if is_strict?(Kernel.elem(stack.function, 0)) do
+        pid(msg_type)
+      else
+        term()
+      end
+
+    {pid_type, context} = of_fun.(pid, pid_expected, expr, stack, context)
+
+    case remote_apply_genserver_call(pid_type, msg_type, stack) do
+      {:ok, type} -> {return(type, [pid_type, msg_type], stack), context}
+      {:error, error} -> remote_error(error, GenServer, :call, 2, expr, stack, context)
+    end
+  end
+
+  defp do_remote(GenServer, :call, [pid, msg, timeout], _expected, expr, stack, context, of_fun) do
+    {msg_type, context} = of_fun.(msg, term(), expr, stack, context)
+
+    pid_expected =
+      if is_strict?(Kernel.elem(stack.function, 0)) do
+        pid(msg_type)
+      else
+        term()
+      end
+
+    {pid_type, context} = of_fun.(pid, pid_expected, expr, stack, context)
+    {timeout_type, context} = of_fun.(timeout, integer(), expr, stack, context)
+
+    case remote_apply_genserver_call(pid_type, msg_type, stack) do
+      {:ok, type} -> {return(type, [pid_type, msg_type, timeout_type], stack), context}
+      {:error, error} -> remote_error(error, GenServer, :call, 3, expr, stack, context)
+    end
+  end
+
+  defp do_remote(GenServer, :cast, [pid, msg], _expected, expr, stack, context, of_fun) do
+    {msg_type, context} = of_fun.(msg, term(), expr, stack, context)
+
+    pid_expected =
+      if is_strict?(Kernel.elem(stack.function, 0)) do
+        pid(msg_type)
+      else
+        term()
+      end
+
+    {pid_type, context} = of_fun.(pid, pid_expected, expr, stack, context)
+
+    case remote_apply_genserver_cast(pid_type, msg_type, stack) do
+      {:ok, type} -> {return(type, [pid_type, msg_type], stack), context}
+      {:error, error} -> remote_error(error, GenServer, :cast, 2, expr, stack, context)
+    end
+  end
+
   defp do_remote(mod, fun, args, expected, expr, stack, context, _of_fun) do
     remote_domain(mod, fun, args, expected, elem(expr, 1), stack, context)
   end
@@ -827,6 +884,68 @@ defmodule Module.Types.Apply do
     {{:strong, nil, [{domain, term()}]}, domain, context}
   end
 
+  # def remote_domain(GenServer, :call, [pid, msg], _expected, _meta, stack, context) do
+  #   pid_type = literal_to_descr(pid, context)
+  #   msg_type = literal_to_descr(msg, context)
+
+  #   dst =
+  #     if is_strict?(Kernel.elem(stack.function, 0)) do
+  #       pid(msg_type)
+  #     else
+  #       pid_type
+  #     end
+
+  #   domain = [dst, term()]
+
+  #   {{:strong, nil, [{domain, dynamic()}]}, domain, context}
+  # end
+
+  # def remote_domain(GenServer, :call, [pid, msg, _timeout], _expected, _meta, stack, context) do
+  #   pid_type = literal_to_descr(pid, context)
+  #   msg_type = literal_to_descr(msg, context)
+
+  #   dst =
+  #     if is_strict?(Kernel.elem(stack.function, 0)) do
+  #       pid(msg_type)
+  #     else
+  #       pid_type
+  #     end
+
+  #   domain = [dst, term(), integer()]
+
+  #   {{:strong, nil, [{domain, dynamic()}]}, domain, context}
+  # end
+
+  # def remote_domain(GenServer, :cast, [pid, msg], _expected, _meta, stack, context) do
+  #   pid_type = literal_to_descr(pid, context)
+  #   msg_type = literal_to_descr(msg, context)
+
+  #   dst =
+  #     if is_strict?(Kernel.elem(stack.function, 0)) do
+  #       pid(msg_type)
+  #     else
+  #       pid_type
+  #     end
+
+  #   domain = [dst, term()]
+
+  #   {{:strong, nil, [{domain, dynamic()}]}, domain, context}
+  # end
+
+  def remote_domain(:erlang, :send, [_dest, msg], _expected, _meta, stack, context) do
+    msg_type = literal_to_descr(msg, context)
+
+    dst =
+      if is_strict?(Kernel.elem(stack.function, 0)) do
+        difference(@send_destination, pid()) |> union(pid(msg_type))
+      else
+        @send_destination
+      end
+
+    domain = [dst, term()]
+    {{:strong, nil, [{domain, dynamic()}]}, domain, context}
+  end
+
   def remote_domain(:maps, :get, [key, _], expected, _meta, _stack, context) when is_atom(key) do
     domain = [term(), open_map([{key, expected}])]
     {{:strong, nil, [{domain, term()}]}, domain, context}
@@ -850,6 +969,7 @@ defmodule Module.Types.Apply do
   end
 
   def remote_domain(mod, fun, args, expected, meta, stack, context) do
+    # Check for strict fun here?
     arity = length(args)
     {info, context} = signature(mod, fun, arity, meta, stack, context)
     {info, filter_domain(info, expected, arity), context}
@@ -897,6 +1017,23 @@ defmodule Module.Types.Apply do
     case list_tl(list) do
       {:ok, value_type} -> {:ok, return(value_type, [list], stack)}
       :badnonemptylist -> {:error, badremote(:erlang, :tl, [list])}
+    end
+  end
+
+  defp remote_apply(:erlang, :send, _info, [dest, msg] = args_types, stack) do
+    # Extract the pid component from the destination type (may be a union with atom/port/ref)
+    case pid_message_type(dest) do
+      :none ->
+        # pid()
+        {:ok, return(dynamic(), args_types, stack)}
+
+      msg_type ->
+        # Typed pid — verify the message is a subtype
+        if subtype?(msg, msg_type) do
+          {:ok, return(dynamic(), args_types, stack)}
+        else
+          {:error, {:bad_typed_pid_send, dest, msg, msg_type}}
+        end
     end
   end
 
@@ -1171,6 +1308,34 @@ defmodule Module.Types.Apply do
     end
   end
 
+  # Type check GenServer.call/2 and GenServer.call/3 based on the PID's protocol
+  # defp remote_apply(GenServer, :call, _info, [pid_type, request_type], stack) do
+  #   remote_apply_genserver_call(pid_type, request_type, stack)
+  # end
+
+  # defp remote_apply(GenServer, :call, _info, [pid_type, request_type, _timeout], stack) do
+  #   remote_apply_genserver_call(pid_type, request_type, stack)
+  # end
+
+  # defp remote_apply(GenServer, :cast, _info, [pid_type, request_type], stack) do
+  #   pid_msg_type = pid_message_type(pid_type)
+
+  #   case pid_msg_type do
+  #     :none ->
+  #       # If we don't know the message type, we can't infer anything about the return type
+  #       {:ok, dynamic()}
+
+  #     _ ->
+  #       if subtype?(request_type, pid_msg_type) do
+  #         {:ok, atom([:ok])}
+  #       else
+  #         {:error,
+  #          {:bad_genserver_call, stack.module, request_type,
+  #           genserver_callback_clauses(stack.module, :handle_cast, 2, stack)}}
+  #       end
+  #   end
+  # end
+
   defp remote_apply(_mod, _fun, info, args_types, stack) do
     remote_apply(info, args_types, stack)
   end
@@ -1363,7 +1528,13 @@ defmodule Module.Types.Apply do
     {args_types, context} =
       zip_map_reduce(args, domain, context, &of_fun.(&1, &2, expr, stack, &3))
 
-    local_apply(local_info, fun, args_types, expr, stack, context)
+    # Apply Strict subtyping
+    if is_strict?(fun) and not zip_subtype?(args_types, domain) do
+      error = {:badlocal, Kernel.elem(local_info, 1), args_types, expr, context}
+      {error_type(), error(error, with_span(elem(expr, 1), fun), stack, context)}
+    else
+      local_apply(local_info, fun, args_types, expr, stack, context)
+    end
   end
 
   defp local_domain(fun, args, expected, meta, stack, context) do
@@ -1606,6 +1777,12 @@ defmodule Module.Types.Apply do
   end
 
   defp zip_not_disjoint?([], []), do: true
+
+  defp zip_subtype?([actual | actuals], [expected | expecteds]) do
+    subtype?(actual, expected) and zip_subtype?(actuals, expecteds)
+  end
+
+  defp zip_subtype?([], []), do: true
 
   ## Error handling
 
@@ -2031,6 +2208,81 @@ defmodule Module.Types.Apply do
     }
   end
 
+  def format_diagnostic(
+        {{:bad_genserver_call, _module, request_type, clauses}, mfac, expr, context}
+      ) do
+    {mod, fun, arity, _converter} = mfac
+    mfa = Exception.format_mfa(mod, fun, arity)
+    traces = collect_traces(expr, context)
+
+    %{
+      details: %{typing_traces: traces},
+      message:
+        IO.iodata_to_binary([
+          """
+          incompatible request type given to #{mfa}:
+
+              #{expr_to_string(expr) |> indent(4)}
+
+          given type:
+
+              #{to_quoted_string(request_type) |> indent(4)}
+
+          but expected a request type that matches one of the following clauses:
+          """,
+          format_traces(traces),
+          clauses_args_to_quoted_string(clauses, &Function.identity/1, collapse_structs: true)
+        ])
+    }
+  end
+
+  def format_diagnostic(
+        {{:bad_genserver_cast, _module, request_type, clauses}, mfac, expr, context}
+      ) do
+    {mod, fun, arity, _converter} = mfac
+    mfa = Exception.format_mfa(mod, fun, arity)
+    traces = collect_traces(expr, context)
+
+    %{
+      details: %{typing_traces: traces},
+      message:
+        IO.iodata_to_binary([
+          """
+          incompatible request type given to #{mfa}:
+
+              #{expr_to_string(expr) |> indent(4)}
+
+          given type:
+
+              #{to_quoted_string(request_type) |> indent(4)}
+
+          but expected a request type that matches one of the following clauses:
+          """,
+          format_traces(traces),
+          clauses_args_to_quoted_string(clauses, &Function.identity/1, collapse_structs: true)
+        ])
+    }
+  end
+
+  def format_diagnostic(
+        {{:bad_typed_pid_send, dest_type, msg_type, expected_type}, mfac, expr, context}
+      ) do
+    {mod, fun, arity, _} = mfac
+
+    %{
+      details: %{typing_traces: collect_traces(expr, context)},
+      message:
+        IO.iodata_to_binary([
+          """
+          incompatible message type in send/2 call to #{Exception.format_mfa(mod, fun, arity)}:
+          expected: #{to_quoted_string(expected_type)}
+          got:      #{to_quoted_string(msg_type)}
+          pid type: #{to_quoted_string(dest_type)}
+          """
+        ])
+    }
+  end
+
   defp empty_arg_reason(args_types) do
     if i = Enum.find_index(args_types, &empty?/1) do
       """
@@ -2162,4 +2414,114 @@ defmodule Module.Types.Apply do
       single_line -> binary_slice(single_line, 1..-2//1)
     end
   end
+
+  # THESIS CHANGE: new GenServer helper section — remote_apply_genserver_call,
+  # handle_call_clauses, handle_cast_clauses, genserver_callback_clauses,
+  # and literal_to_descr family for converting quoted AST literals to type descriptors
+  ### GenServer Helpers
+
+  # Helper for GenServer.call type inference
+  defp remote_apply_genserver_call(pid_type, request_type, stack) do
+    pid_msg_type = pid_message_type(pid_type)
+
+    pid_ret_type = pid_return_type(pid_type)
+
+    case pid_msg_type do
+      :none ->
+        # If we don't know the message type, we can't infer anything about the return type
+        {:ok, dynamic()}
+
+      _ ->
+        if subtype?(request_type, pid_msg_type) do
+          {:ok, return(pid_ret_type, [pid_type, request_type], stack)}
+        else
+          {:error,
+           {:bad_genserver_call, stack.module, request_type,
+            genserver_callback_clauses(stack.module, :handle_call, 3, stack)}}
+        end
+    end
+  end
+
+  defp remote_apply_genserver_cast(pid_type, request_type, stack) do
+    pid_msg_type = pid_message_type(pid_type)
+
+    case pid_msg_type do
+      :none ->
+        {:ok, dynamic()}
+
+      _ ->
+        if subtype?(request_type, pid_msg_type) do
+          {:ok, return(atom([:ok]), [pid_type, request_type], stack)}
+        else
+          {:error,
+           {:bad_genserver_cast, stack.module, request_type,
+            genserver_callback_clauses(stack.module, :handle_cast, 2, stack)}}
+        end
+    end
+  end
+
+  def genserver_callback_clauses(module, fun, arity, stack) do
+    case ParallelChecker.fetch_export(stack.cache, module, fun, arity, false) do
+      {:ok, _, _, {_, _domain, clauses}} -> clauses
+      _ -> []
+    end
+  end
+
+  # Convert quoted literals to their descriptor representation.
+  defp literal_to_descr(literal, _context) when is_atom(literal), do: atom([literal])
+  defp literal_to_descr(literal, _context) when is_integer(literal), do: integer()
+  defp literal_to_descr(literal, _context) when is_float(literal), do: float()
+  defp literal_to_descr(literal, _context) when is_binary(literal), do: binary()
+  # TODO: handle internal types of pid
+  defp literal_to_descr(literal, _context) when is_pid(literal), do: pid()
+  defp literal_to_descr(literal, _context) when is_port(literal), do: port()
+  defp literal_to_descr(literal, _context) when is_reference(literal), do: reference()
+  defp literal_to_descr([], _context), do: empty_list()
+
+  # look up var in context, if not found, treat as term()
+  defp literal_to_descr({_name, [{_, version} | _] = _meta, _} = literal, context)
+       when is_var(literal) do
+    case context.vars do
+      %{^version => %{type: type}} ->
+        type
+
+      _ ->
+        term()
+    end
+  end
+
+  defp literal_to_descr(list, context) when is_list(list) do
+    {prefix, suffix} = unpack_list(list, [])
+
+    head_type =
+      case prefix do
+        [] -> term()
+        _ -> prefix |> Enum.map(&literal_to_descr(&1, context)) |> Enum.reduce(&union/2)
+      end
+
+    suffix_type = if suffix == [], do: empty_list(), else: literal_to_descr(suffix, context)
+    non_empty_list(head_type, suffix_type)
+  end
+
+  defp literal_to_descr({left, right}, context),
+    do: tuple([literal_to_descr(left, context), literal_to_descr(right, context)])
+
+  defp literal_to_descr({:{}, _meta, entries}, context) when is_list(entries) do
+    tuple(Enum.map(entries, &literal_to_descr(&1, context)))
+  end
+
+  defp literal_to_descr({:%{}, _meta, entries}, context) when is_list(entries) do
+    known_entries =
+      Enum.flat_map(entries, fn
+        {key, value} when is_atom(key) -> [{key, literal_to_descr(value, context)}]
+        _ -> []
+      end)
+
+    case known_entries do
+      [] -> open_map()
+      _ -> open_map(known_entries)
+    end
+  end
+
+  defp literal_to_descr(_other, _context), do: term()
 end
