@@ -549,6 +549,23 @@ defmodule Module.Types.Expr do
     Apply.fun(fun_type, args_types, call, stack, context)
   end
 
+  def of_expr(
+        {{:., _, [GenServer, :start_link]}, _meta, [_mod | _] = args} = call,
+        _expected,
+        _expr,
+        stack,
+        context
+      ) do
+    {_args_types, context} =
+      Enum.map_reduce(args, context, &of_expr(&1, dynamic(), call, stack, &2))
+
+    {pid_type, context} = Apply.self_pid_type(stack, context)
+    success_type = tuple([atom([:ok]), pid_type])
+    error_type = union(tuple([atom([:error]), term()]), atom([:ignore]))
+
+    {union(success_type, error_type), context}
+  end
+
   def of_expr({{:., _, [callee, key_or_fun]}, meta, []} = call, expected, expr, stack, context)
       when not is_atom(callee) and is_atom(key_or_fun) do
     if Keyword.get(meta, :no_parens, false) do
@@ -838,6 +855,19 @@ defmodule Module.Types.Expr do
             Pattern.of_head(patterns, guards, domain, previous, info, meta, stack, context)
 
           {result, context} = of_body.(trees, body, context)
+
+          # Try and narrow type based on clause body
+          context =
+            if Map.has_key?(context, :receive_acc) and base_info == :receive and
+                 not context.failed do
+              body_clause_type = Pattern.of_domain(trees, stack, context)
+
+              Enum.reduce(body_clause_type, context, fn type, context ->
+                update_in(context.receive_acc, &union(&1, type))
+              end)
+            else
+              context
+            end
 
           {of_acc.(trees, result, context, acc), previous,
            context |> set_failed(failed?) |> Of.reset_vars(original)}
